@@ -1,0 +1,62 @@
+az login
+az account set --subscription "2e20e6b8-e24f-4d7a-ad5c-bfdde4b8708f"
+
+## Create AKS cluster in Azure
+$resource_group_name = 'rg-auae-keda'
+$resource_location = 'Australia East'
+$aks_cluster_name = 'k8s-auae-keda'
+
+az group create --name $resource_group_name --location $resource_location
+
+az acr create --name $acrname --resource-group $resource_group_name --sku Standard --admin-enabled true
+az aks create --name $aks_cluster_name --resource-group $resource_group_name --node-count 2 --enable-addons monitoring --enable-managed-identity --generate-ssh-keys 
+az aks get-credentials --resource-group $resource_group_name --name $aks_cluster_name
+
+## Deploy keda
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+kubectl create namespace keda
+helm install keda kedacore/keda --version 2.0.0 --namespace keda
+
+## Service Bus
+$service_bus_namespace = "sbn-auae-keda"
+az servicebus namespace create --name $service_bus_namespace --resource-group $resource_group_name --sku basic
+az servicebus queue create --namespace-name $service_bus_namespace --name orders --resource-group $resource_group_name
+az servicebus queue authorization-rule create --resource-group $resource_group_name --namespace-name $service_bus_namespace --queue-name orders --name order-consumer --rights Listen
+az servicebus queue authorization-rule keys list --resource-group $resource_group_name --namespace-name $service_bus_namespace --queue-name orders --name order-consumer
+
+
+## STOP HERE and update ./connection-string/deploy-app.yaml file with base64 encoded service bus connection string
+## echo -n "<connection string>" | base64
+
+## Order Processor
+kubectl create namespace keda-dotnet-sample
+kubectl apply -f ./deploy/connection-string/deploy-app.yaml --namespace keda-dotnet-sample
+kubectl get secrets --namespace keda-dotnet-sample
+kubectl get deployments --namespace keda-dotnet-sample -o wide
+
+az servicebus queue authorization-rule create --resource-group $resource_group_name --namespace-name $service_bus_namespace --queue-name orders --name keda-monitor --rights Manage Send Listen
+az servicebus queue authorization-rule keys list --resource-group $resource_group_name --namespace-name $service_bus_namespace --queue-name orders --name keda-monitor
+
+## STOP HERE Get and encode the connection string as mentioned above and store it in servicebus-order-management-connectionstring for our secret in deploy-autoscaling.yaml.
+
+kubectl apply -f ./deploy/connection-string/deploy-autoscaling.yaml --namespace keda-dotnet-sample
+
+## STOP HERE : Apply load
+dotnet run --project .\src\Keda.Samples.Dotnet.OrderGenerator\Keda.Samples.Dotnet.OrderGenerator.csproj
+
+kubectl get deployments --namespace keda-dotnet-sample -o wide
+kubectl get pods --namespace keda-dotnet-sample
+
+## Deploy web application
+## STOP HERE Get and encode the connection string as mentioned above and store it in servicebus-order-management-connectionstring for our secret in deploy-web.yaml.
+
+kubectl apply -f ./deploy/deploy-web.yaml --namespace keda-dotnet-sample
+kubectl get svc kedasampleweb --namespace keda-dotnet-sample
+
+
+## DELETE
+# kubectl delete -f ./connection-string/deploy-autoscaling.yaml --namespace keda-dotnet-sample
+# kubectl delete -f ./connection-string/deploy-app.yaml --namespace keda-dotnet-sample
+# kubectl delete namespace keda-dotnet-sample
+# az servicebus namespace delete --name $service_bus_namespace --resource-group $resource_group_name
